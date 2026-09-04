@@ -1,0 +1,28 @@
+# Mini-RAG 打包配置 —— 最小化。
+# 版本双源同步点（release 时两处必须一致）：
+#   1. 本文件 [project].version
+#   2. mini_rag/__init__.py 的 __version__
+# 备选方案：version 改用 dynamic = ["version"] + attr = "mini_rag.__version__"
+# 可结构性消除双源漂移；当前按显式声明约定执行。
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-rag"
+version = "0.2.0"
+description = "本地轻量化 RAG 知识检索系统 —— 只做一件事：RAG。"
+readme = "README.md"
+requires-python = ">=3.10"
+# 依赖单一事实源：引用 requirements.txt，避免两份清单漂移
+dynamic = ["dependencies"]
+
+[project.scripts]
+mini-rag = "mini_rag.cli:main"
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["mini_rag*"]
