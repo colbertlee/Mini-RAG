@@ -65,8 +65,24 @@ fi
 TAGNAME="${VER#v}"                 # 去掉 v 用于标题/文件名，保持 v 用于 git tag 更稳可省
 
 # ---- 校验：tag 未占用 ----
+# 2026-09-04 踩坑修正：release.sh 常被拆成两次运行（沙箱先跑一次 → 批准后再跑），
+# 第一次可能已成功打了本地 tag 但没推完，第二次就卡在这里报「tag 已存在」而束手无策。
+# 因此这里不再简单报错退出，而是诊断出「远程有没有该 tag」并给出确切的续跑命令。
 if git rev-parse "$VER" >/dev/null 2>&1; then
-    echo "❌ tag $VER 已存在。想重发请先删除本地+远程，或用 --notes 复用。" >&2
+    # ⚠️ annotated tag 的 show-ref / ls-remote 显示的是 **tag object hash，不是 commit hash**
+    #    （例：v0.2.1 → 36a5a8a，而其真实 commit 是 ed17b1e）。
+    #    必须用 ^{commit} 取真实指向，否则会把「tag 正常指向自己的提交」误判成孤儿 tag 而误删。
+    TAG_COMMIT="$(git rev-parse "${VER}^{commit}" 2>/dev/null || echo '未知')"
+    NOTES_HINT="${NOTES_FLAG:-$ROOT/_build/RELEASE_NOTES_${VER}.md}"
+    echo "❌ tag $VER 已存在 → commit ${TAG_COMMIT:0:7}" >&2
+    if git ls-remote --tags origin 2>/dev/null | grep -q "refs/tags/${VER}$"; then
+        echo "   远程已存在该 tag —— 确要重发请先删本地+远程：" >&2
+        echo "     git tag -d $VER && git push origin --delete $VER" >&2
+    else
+        echo "   远程尚无该 tag —— 上次只打了本地 tag 没推完，补两条命令即可（bypass 沙箱执行）：" >&2
+        echo "     git push origin main $VER" >&2
+        echo "     $GH release create $VER --title \"Mini-RAG $VER\" --notes-file \"$NOTES_HINT\" --repo $REPO" >&2
+    fi
     exit 1
 fi
 
