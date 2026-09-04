@@ -25,9 +25,14 @@ _collection = None
 
 def _col():
     global _client, _collection
-    if _client is None:
+    # 以 _collection 为准判断是否要初始化（不能以 _client 为准）：
+    # rebuild_all() 会先实例化 _client 再 delete_collection，之后 _collection=None。
+    # 若这里只看 _client is None，则 _collection 保持 None，dense_upsert 会报
+    # "'NoneType' object has no attribute 'upsert'"（2026-09-04 重建踩坑）。
+    if _collection is None:
         settings.ensure_dirs()
-        _client = chromadb.PersistentClient(path=str(settings.VECTOR_DIR))
+        if _client is None:
+            _client = chromadb.PersistentClient(path=str(settings.VECTOR_DIR))
         _collection = _client.get_or_create_collection(
             "mini_rag", metadata={"hnsw:space": "cosine"})
     return _collection

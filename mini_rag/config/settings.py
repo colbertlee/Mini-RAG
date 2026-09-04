@@ -118,6 +118,12 @@ SPARSE_TOP_K = 20
 RRF_K = 60
 FINAL_TOP_N = 4
 
+# 2026-09-04 深度优化新增开关（默认全开；任一关掉即降级为对应子层的 dense 单路）。
+# 设计原则：改造是叠加式的，关掉任何一层不破坏既有行为。
+QUERY_REWRITE_ENABLED = True   # 关 = 不做 L1 同义词扩展 / svc 归一 / 子查询拆分
+HYDE_ENABLED = True            # 关 = 不调 LLM 生成假设性段落
+MMR_ENABLED = True             # 关 = 不做 MMR 去冗余，top-N 按 RRF 分数直接切
+
 # 融合策略开关（2026-09-03 架构评审后落地）：
 #   True  = dense 主力 + sparse 兜底（当前语料组合的正确姿势）。
 #           查询中文 vs 语料英文时，FTS5 稀疏路跨语言结构性失效（纯中文查询召回 0），
@@ -153,7 +159,7 @@ INFERENCE_PHRASES = [
 # 示例（Windows 绝对路径，用正斜杠）：
 #   INCLUDE_DIRS = [r"C:/path/to/your/docs"]
 INCLUDE_DIRS = [
-    # r"C:/path/to/your/docs",
+    r"C:/BaiduSyncdisk/Works/Powerstore",
 ]
 EXCLUDE_DIRS = {
     "node_modules", ".venv", "venv", "__pycache__", ".git",
