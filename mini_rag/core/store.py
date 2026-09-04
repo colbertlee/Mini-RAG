@@ -281,6 +281,18 @@ def sparse_count() -> int:
     return _db().execute("SELECT count(*) FROM chunks").fetchone()[0]
 
 
+def count_chunks_containing(term: str) -> int:
+    """含指定子串（大小写不敏感）的 chunk 数——查询词的语料文档频率（DF）。
+
+    用 instr 而非 FTS5 MATCH：与检索闸门的子串判定语义保持一致
+    （FTS5 分词器会把 4.3.0.0 / svc_xxx 拆碎， instr 保真）。
+    仅用于查询侧词项分级（泛词/判别词），1352~3400 行全表扫描毫秒级，调用方应缓存。
+    """
+    return _db().execute(
+        "SELECT count(*) FROM chunks WHERE instr(lower(content), ?) > 0",
+        (term.lower(),)).fetchone()[0]
+
+
 def sparse_delete_by_file(file_path: str) -> None:
     db = _db()
     cids = [r[0] for r in db.execute(

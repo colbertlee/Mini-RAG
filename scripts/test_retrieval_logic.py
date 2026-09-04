@@ -66,6 +66,53 @@ def test_mpr_basic():
     print("✓ test_mpr_basic")
 
 
+# ============ 1b) _mpr 同文档票数封顶（2026-09-04 深夜立项）============
+def test_mpr_doc_cap_off_equals_plain():
+    """cap=0（关闭）时与经典 RRF 完全一致。"""
+    lists = [[("a", 0.9), ("b", 0.8), ("c", 0.7)]]
+    doc_of = {"a": "d1", "b": "d1", "c": "d1"}
+    assert retriever._mpr(lists, k=60, doc_of=doc_of, cap=0) == \
+        retriever._mpr(lists, k=60)
+    print("✓ test_mpr_doc_cap_off_equals_plain")
+
+
+def test_mpr_doc_cap_collapses_pile():
+    """同 doc 3 块 rank1/2/3，cap=2 → 第 3 块票作废；异 doc 不受影响。"""
+    lists = [[("a", 0.9), ("b", 0.8), ("c", 0.7), ("x", 0.6)]]
+    doc_of = {"a": "d1", "b": "d1", "c": "d1", "x": "d9"}
+    rrf = retriever._mpr(lists, k=60, doc_of=doc_of, cap=2)
+    assert abs(rrf["a"] - 1 / 61) < 1e-9
+    assert abs(rrf["b"] - 1 / 62) < 1e-9
+    assert "c" not in rrf, f"同 doc 第 3 票应作废: {rrf}"
+    assert abs(rrf["x"] - 1 / 64) < 1e-9, "异 doc 的票不应受影响"
+    print("✓ test_mpr_doc_cap_collapses_pile")
+
+
+def test_mpr_doc_cap_keeps_cross_variant_consensus():
+    """跨变体共识不受影响：同 doc 在 3 个 list 各占 rank1，每路第 1 票都全额。"""
+    lists = [
+        [("a", 0.9), ("z", 0.8)],
+        [("a", 0.9), ("y", 0.8)],
+        [("a", 0.9), ("w", 0.8)],
+    ]
+    doc_of = {"a": "d1", "z": "d2", "y": "d3", "w": "d4"}
+    rrf = retriever._mpr(lists, k=60, doc_of=doc_of, cap=2)
+    assert abs(rrf["a"] - 3 / 61) < 1e-9, f"3 路各 1 票应全额累加: {rrf}"
+    print("✓ test_mpr_doc_cap_keeps_cross_variant_consensus")
+
+
+def test_mpr_doc_cap_file_level_safety():
+    """文件级安全：GT 块是同 doc 第 3 名时其票作废，但同文件前 2 块仍有票在榜
+    （doc_id=file_hash 前缀，同 doc 即同文件，hit@k 是文件级）。"""
+    lists = [[("g1", 0.9), ("g2", 0.8), ("gt", 0.7), ("o", 0.6)]]
+    doc_of = {"g1": "dg", "g2": "dg", "gt": "dg", "o": "d9"}
+    rrf = retriever._mpr(lists, k=60, doc_of=doc_of, cap=2)
+    assert "gt" not in rrf
+    assert abs(rrf["g1"] - 1 / 61) < 1e-9, "同文件第 1 票必须全额保留"
+    assert rrf["g1"] > rrf["o"], "文件 dg 仍应高于只 rank4 的 o"
+    print("✓ test_mpr_doc_cap_file_level_safety")
+
+
 # ============ 2) _mmr_select ============
 def test_mmr_dedup():
     # 6 个候选：A 高分同页；B 中分同页；C 低分不同页；D 高分不同 doc；
@@ -323,6 +370,8 @@ def test_disable_rewrite():
     fake_hits = [(_chunk("c1", doc_id="d1"), 0.9)]
     with patch("mini_rag.config.settings.QUERY_REWRITE_ENABLED", False), \
          patch("mini_rag.core.retriever.store.dense_search", return_value=fake_hits), \
+         patch("mini_rag.core.retriever.store.query_terms", return_value=[]), \
+         patch("mini_rag.core.retriever.store.sparse_search", return_value=[]), \
          patch("mini_rag.core.retriever.qr_mod.rewrite") as mock_rewrite:
         scored, _ = retriever.retrieve("test", mock_vec=fake_vec)
     mock_rewrite.assert_not_called()
@@ -336,6 +385,8 @@ def test_disable_hyde():
     fake_hits = [(_chunk("c1", doc_id="d1"), 0.9)]
     with patch("mini_rag.config.settings.HYDE_ENABLED", False), \
          patch("mini_rag.core.retriever.store.dense_search", return_value=fake_hits), \
+         patch("mini_rag.core.retriever.store.query_terms", return_value=[]), \
+         patch("mini_rag.core.retriever.store.sparse_search", return_value=[]), \
          patch("mini_rag.core.retriever.hyde_mod.expand") as mock_hyde:
         scored, _ = retriever.retrieve("test", mock_vec=fake_vec)
     mock_hyde.assert_not_called()
@@ -349,6 +400,8 @@ def test_disable_mmr():
                  for i in range(5)]
     with patch("mini_rag.config.settings.MMR_ENABLED", False), \
          patch("mini_rag.core.retriever.store.dense_search", return_value=fake_hits), \
+         patch("mini_rag.core.retriever.store.query_terms", return_value=[]), \
+         patch("mini_rag.core.retriever.store.sparse_search", return_value=[]), \
          patch("mini_rag.core.retriever._mmr_select") as mock_mmr:
         scored, _ = retriever.retrieve("test", mock_vec=fake_vec)
     mock_mmr.assert_not_called()
@@ -357,7 +410,137 @@ def test_disable_mmr():
     print("✓ test_disable_mmr")
 
 
-# ============ 7) L3 生成后校验（零幻觉第三道）============
+# ============ 7) sparse 阈值闸门（2026-09-04 全量 RRF 融合前置）============
+def test_sparse_gate_pure_chinese_rejected():
+    """纯中文查询（无英文 token）→ sparse 整路判空，不参与融合。"""
+    from mini_rag.core import retriever as r
+    with patch.object(r.settings, "SPARSE_REQUIRE_EN_TOKEN", True), \
+         patch.object(r.settings, "SPARSE_MIN", 8.0), \
+         patch("mini_rag.core.retriever.store.sparse_search",
+              return_value=[(_chunk("n1", content="PowerStore 使用服务 LAN 端口"),
+                             20.0)]):
+        gated = r._sparse_gated("交换机怎么配置", ["交换机", "配置"], 20)
+    assert gated == [], f"纯中文查询 sparse 应判空: {gated}"
+    print("✓ test_sparse_gate_pure_chinese_rejected")
+
+
+def test_sparse_gate_english_token_not_in_content_rejected():
+    """查询有英文 token 但未命中 chunk 正文 → 判跨语言噪声。"""
+    from mini_rag.core import retriever as r
+    # N02 场景：查 Brocade/zone，召回的是中文文档（英文 token 不在正文）
+    with patch.object(r.settings, "SPARSE_REQUIRE_EN_TOKEN", True), \
+         patch.object(r.settings, "SPARSE_MIN", 8.0), \
+         patch("mini_rag.core.retriever.store.sparse_search",
+              return_value=[(_chunk("n2", content="使用服务 LAN 端口访问 SSH 和 PowerStore Manager"),
+                             16.76)]):
+        gated = r._sparse_gated("如何在 Brocade 交换机上配置 zone",
+                                ["Brocade", "交换机", "配置", "zone"], 20)
+    assert gated == [], f"英文 token 未命中正文应判噪声: {gated}"
+    print("✓ test_sparse_gate_english_token_not_in_content_rejected")
+
+
+def test_sparse_gate_english_token_hit_passes():
+    """查询英文 token 命中 chunk 正文 → 放行。"""
+    from mini_rag.core import retriever as r
+    with patch.object(r.settings, "SPARSE_REQUIRE_EN_TOKEN", True), \
+         patch.object(r.settings, "SPARSE_MIN", 8.0), \
+         patch("mini_rag.core.retriever.store.sparse_search",
+              return_value=[(_chunk("p", content="Run svc_factory_reset to reinitialize the PowerStore"),
+                             28.06)]):
+        gated = r._sparse_gated("svc_factory_reset 怎么用",
+                                ["svc_factory_reset", "怎么"], 20)
+    assert len(gated) == 1, f"英文 token 命中应放行: {gated}"
+    print("✓ test_sparse_gate_english_token_hit_passes")
+
+
+def test_sparse_gate_low_score_rejected():
+    """绝对分数 < SPARSE_MIN → 挡掉近乎随机噪声。"""
+    from mini_rag.core import retriever as r
+    with patch.object(r.settings, "SPARSE_REQUIRE_EN_TOKEN", False), \
+         patch.object(r.settings, "SPARSE_MIN", 8.0), \
+         patch("mini_rag.core.retriever.store.sparse_search",
+              return_value=[(_chunk("low", content="something"), 3.5)]):
+        gated = r._sparse_gated("quantum encryption", ["quantum", "encryption"], 20)
+    assert gated == [], f"低分应被 SPARSE_MIN 挡掉: {gated}"
+    print("✓ test_sparse_gate_low_score_rejected")
+
+
+# ============ 7.5) 查询级语料证据闸（规则 G/F，2026-09-04 晚）============
+def test_query_gate_absent_english_token_rejected():
+    """规则 G：查询存在 DF=0 的英文 token（brocade）→ KB 零覆盖 → 拒答。"""
+    from mini_rag.core import retriever as r
+    reason = r._query_evidence_gate("如何在 Brocade 交换机上配置 zone")
+    assert reason == "no_subject_evidence", f"brocade DF=0 应拒答: {reason!r}"
+    print("✓ test_query_gate_absent_english_token_rejected")
+
+
+def test_query_gate_chinese_no_evidence_rejected():
+    """规则 F：判别词空（powerstore 是泛词）+ 中文概念全无证据（量子/加密
+    DF=0 且不在词典）→ 拒答。"""
+    from mini_rag.core import retriever as r
+    reason = r._query_evidence_gate("PowerStore 量子加密")
+    assert reason == "no_subject_evidence", f"量子加密应拒答: {reason!r}"
+    print("✓ test_query_gate_chinese_no_evidence_rejected")
+
+
+def test_query_gate_passes_answerable_queries():
+    """正例不误伤：词典翻译词（告警→alert）与罕见但存在的术语都放行。"""
+    from mini_rag.core import retriever as r
+    # P05：中文词 DF=0，但 故障/告警 在词典 → 有证据
+    assert r._query_evidence_gate("PowerStore 数据库卷故障告警") == "", \
+        "告警可翻译成 alert，不应拒答"
+    # P02：bbu DF=52 判别词非空，无 DF=0 token → 通过
+    assert r._query_evidence_gate("PowerStore 怎么更换 BBU？") == "", \
+        "bbu 存在于语料，不应拒答"
+    # P25：全英文罕见术语，DF 全 >0 → 通过
+    assert r._query_evidence_gate("TRIF Metro SCSI Persistent Reservations") == "", \
+        "P25 术语都存在，不应拒答"
+    print("✓ test_query_gate_passes_answerable_queries")
+
+
+def test_dense_candidates_require_discriminative_hit():
+    """dense 判别词检查：高分 chunk 未命中任何判别词 → 出池（N03 场景：
+    「PowerStore Docker 安装」的 BBU 文档 0.700 不含 docker，不算证据）。"""
+    from mini_rag.core import retriever as r
+    fake_vec = [0.0] * 2560
+    # 高分 chunk：不含 docker → 判别词检查拒绝
+    fake_hits = [(_chunk("c1", content="How to identify failing BBU for replacement"), 0.70)]
+    with patch("mini_rag.core.retriever.embed_query", return_value=fake_vec), \
+         patch("mini_rag.core.retriever.store.dense_search", return_value=fake_hits), \
+         patch("mini_rag.core.retriever.store.query_terms", return_value=[]), \
+         patch("mini_rag.core.retriever.store.sparse_search", return_value=[]), \
+         patch("mini_rag.core.retriever.qr_mod.rewrite",
+               return_value=["PowerStore Docker 安装"]), \
+         patch("mini_rag.core.retriever.hyde_mod.is_enabled", return_value=False):
+        scored, reason = r.retrieve("PowerStore Docker 安装")
+    assert scored == [], f"未命中判别词的高分 chunk 应出池: {scored}"
+    assert reason == "below_threshold", f"reason 应为 below_threshold: {reason!r}"
+    # 反向：chunk 命中判别词 docker → 保留
+    fake_hits2 = [(_chunk("c2", content="Docker containers are not supported"), 0.70)]
+    with patch("mini_rag.core.retriever.embed_query", return_value=fake_vec), \
+         patch("mini_rag.core.retriever.store.dense_search", return_value=fake_hits2), \
+         patch("mini_rag.core.retriever.store.query_terms", return_value=[]), \
+         patch("mini_rag.core.retriever.store.sparse_search", return_value=[]), \
+         patch("mini_rag.core.retriever.qr_mod.rewrite",
+               return_value=["PowerStore Docker 安装"]), \
+         patch("mini_rag.core.retriever.hyde_mod.is_enabled", return_value=False):
+        scored2, reason2 = r.retrieve("PowerStore Docker 安装")
+    assert len(scored2) == 1 and scored2[0].chunk.chunk_id == "c2", \
+        f"命中判别词的 chunk 应保留: {scored2}"
+    print("✓ test_dense_candidates_require_discriminative_hit")
+
+
+def test_sparse_gate_mock_path_skips_token_check():
+    """check_tokens=False（离线 mock 路径）→ 不做判别词判断，直接返回 sparse 结果。"""
+    from mini_rag.core import retriever as r
+    with patch("mini_rag.core.retriever.store.sparse_search",
+              return_value=[(_chunk("m1", content="任意内容"), 20.0)]):
+        gated = r._sparse_gated("纯中文无判别词", ["词"], 20, check_tokens=False)
+    assert len(gated) == 1, f"mock 路径应跳过词项检查: {gated}"
+    print("✓ test_sparse_gate_mock_path_skips_token_check")
+
+
+# ============ 8) L3 生成后校验（零幻觉第三道）============
 # generator.validate_answer 已在 mini_rag/core/generator.py 实现（4 条规则），
 # 但此前无测试覆盖。这里补齐，并显式覆盖「误伤」边界——
 # 校验过严会把忠实转述也降级，等于把可用性让给零幻觉，两头不讨好。
@@ -448,6 +631,10 @@ def test_validate_no_false_positive_on_plain_text():
 def main() -> int:
     tests = [
         test_mpr_basic,
+        test_mpr_doc_cap_off_equals_plain,
+        test_mpr_doc_cap_collapses_pile,
+        test_mpr_doc_cap_keeps_cross_variant_consensus,
+        test_mpr_doc_cap_file_level_safety,
         test_mmr_dedup,
         test_rewrite_zh_to_en,
         test_rewrite_svc_norm,
@@ -466,6 +653,15 @@ def main() -> int:
         test_disable_rewrite,
         test_disable_hyde,
         test_disable_mmr,
+        test_sparse_gate_pure_chinese_rejected,
+        test_sparse_gate_english_token_not_in_content_rejected,
+        test_sparse_gate_english_token_hit_passes,
+        test_sparse_gate_low_score_rejected,
+        test_query_gate_absent_english_token_rejected,
+        test_query_gate_chinese_no_evidence_rejected,
+        test_query_gate_passes_answerable_queries,
+        test_dense_candidates_require_discriminative_hit,
+        test_sparse_gate_mock_path_skips_token_check,
         test_validate_citation_out_of_range,
         test_validate_inference_phrase,
         test_validate_command_not_in_context,
