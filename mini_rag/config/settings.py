@@ -40,6 +40,16 @@ EMBED_BATCH = 32
 EMBED_RETRIES = 3
 REQUEST_TIMEOUT = 600
 
+# Embedding 模型驻留策略（2026-09-04 新增，此前硬编码 "0"）。
+#   "0"   = 用完即卸载 —— 生产默认。避免 2.5GB embedding 与 3.4GB 生成模型
+#           同时驻留把本机（15.7GB）内存打爆。
+#   "10m" = 常驻 10 分钟 —— 批量评估/建索引时用。
+#           踩过的坑：30 条评估 × 每条重新加载 2.5GB = 30 次内存冲击，
+#           Ollama 直接崩（WinError 10061 拒绝连接），且崩前已跑的数据全丢。
+#           批量场景下必须设长，跑完用 keep_alive=0 调一次卸载。
+# 可用环境变量 MINIRAG_EMBED_KEEP_ALIVE 覆盖（评估脚本设它最方便）。
+EMBED_KEEP_ALIVE = os.environ.get("MINIRAG_EMBED_KEEP_ALIVE", "0")
+
 # ---- 吞吐预估（按可用内存自适应，供 pipeline._embed_rate 使用）----
 # 两个实测锚点（2026-09-03 本机）：可用内存充足（模型完全驻留）≈ 6 chunks/s；
 # 可用内存 < 模型大小（严重换页）≈ 0.37 chunks/s（60 文件啃了 64 分钟）。
@@ -123,6 +133,13 @@ FINAL_TOP_N = 4
 QUERY_REWRITE_ENABLED = True   # 关 = 不做 L1 同义词扩展 / svc 归一 / 子查询拆分
 HYDE_ENABLED = True            # 关 = 不调 LLM 生成假设性段落
 MMR_ENABLED = True             # 关 = 不做 MMR 去冗余，top-N 按 RRF 分数直接切
+
+# HyDE LRU 缓存（2026-09-04）：HyDE 单次 LLM 调用 ~12s，是 full 栈 latency 的主要来源。
+# CLI 每次 ask 都是新进程，缓存必须落盘才有效。命中则完全跳过 LLM 调用。
+HYDE_CACHE_ENABLED = True      # 关 = 每次都调 LLM（用于评估对照 / 调试）
+HYDE_CACHE_SIZE = 200          # LRU 上限，超出淘汰最久未用
+HYDE_CACHE_PATH = DATA_DIR / "hyde_cache.jsonl"
+HYDE_MAX_WORDS = 45            # 假设段落硬截断词数（prompt 要求 30-40，留 5 词余量）
 
 # 融合策略开关（2026-09-03 架构评审后落地）：
 #   True  = dense 主力 + sparse 兜底（当前语料组合的正确姿势）。

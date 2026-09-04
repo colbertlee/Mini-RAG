@@ -4,9 +4,13 @@
   1. _mpr（RRF）正确性
   2. _mmr_select 去冗余正确性（同 doc_id / 同 page 应被降权）
   3. query_rewrite 中文→英文、svc_xxx 归一、长 query 拆分
+  3b. query_rewrite 保留英文专名（P15/P21 的关键修复）
   4. hyde 失败时返回 [query] 不报错
+  4b. hyde LRU 缓存：命中跳过 LLM / 未命中调 LLM / 淘汰 / 持久化
+  4c. hyde 段落词数截断（30-40 词压缩）
   5. retriever 整体：mock_vec 路径不调 embed_query、不调 LLM
   6. retriever：3 个开关（QUERY_REWRITE / HYDE / MMR）独立降级
+  7. generator.validate_answer（L3 零幻觉第三道）四条规则
 
 跑法：
     python scripts/test_retrieval_logic.py
@@ -39,8 +43,9 @@ def _scored(cid: str, dense: float, **kw) -> ScoredChunk:
         doc_id="d1", file_path="/x.pdf", file_name="x.pdf", page=1,
         content=cid)
     base.update(kw)
-    c = _chunk(cid, **{k: v for k, v in base.items()
-                        if k in ("doc_id", "file_path", "file_name", "page")})
+    c = _chunk(cid, content=base.get("content", ""),
+               **{k: v for k, v in base.items()
+                  if k in ("doc_id", "file_path", "file_name", "page")})
     return ScoredChunk(chunk=c, dense_score=dense, sparse_score=0.0,
                        rrf_score=dense, matched_by="dense")
 
@@ -126,23 +131,163 @@ def test_rewrite_no_zh_no_change():
     print("✓ test_rewrite_no_zh_no_change")
 
 
+# ============ 3b) query_rewrite 保留英文专名（P15/P21 关键修复）============
+def test_rewrite_keeps_english_proper_nouns():
+    """中文改写必须保留 query 里的英文专名（产品名 / 版本号 / svc 命令）。
+
+    这是 P15 / P21 的真正病因：旧实现只输出中文术语的英文翻译，
+    把 "PowerStore 4.3.0.0 release note"、"svc_journalctl" 这类最强信号全丢了，
+    而 ground_truth 恰恰就是这些英文专名。
+    """
+    # P15：ground_truth = pwrstr-4-3-0-0-rn → 版本号 + release note 必须留住
+    qs = qr.rewrite("PowerStore 4.3.0.0 release note 变更内容")
+    assert any("PowerStore" in q and "4.3.0.0" in q and "release" in q.lower()
+               for q in qs), f"P15 英文专名丢了: {qs}"
+    assert any("change" in q.lower() for q in qs), f"P15「变更」未翻译: {qs}"
+
+    # P21：ground_truth = svc_journalctl → svc_ 前缀必须留住
+    qs = qr.rewrite("svc_journalctl 怎么看日志")
+    assert any("svc_journalctl" in q for q in qs), f"P21 svc_journalctl 丢了: {qs}"
+
+    # 通用：英文产品名 NAS server
+    qs = qr.rewrite("如何查看 NAS server 状态")
+    assert any("NAS" in q and "server" in q for q in qs), f"NAS server 丢了: {qs}"
+
+    # 翻译词不应与专名重复（"如何更换 BBU？" 不应出现 "BBU ... BBU battery"）
+    qs = qr.rewrite("如何更换 BBU？")
+    for q in qs[1:]:
+        assert q.lower().count("bbu") <= 1, f"BBU 重复: {q!r}"
+    print("✓ test_rewrite_keeps_english_proper_nouns")
+
+
 # ============ 4) hyde 失败降级 ============
 def test_hyde_fail_falls_back():
     """LLM 不可达 → expand 返回 [query]，不报错。"""
     with patch.object(hyde_mod, "_hyde_llm", return_value=""):
-        out = hyde_mod.expand("BBU 怎么换？", llm_generate=True)
+        with patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", False):
+            out = hyde_mod.expand("BBU 怎么换？", llm_generate=True)
     assert out == ["BBU 怎么换？"], f"降级失败: {out}"
     print("✓ test_hyde_fail_falls_back")
 
 
 def test_hyde_success():
     """LLM 返回正常 → expand 返回 [query, fake]。"""
-    with patch.object(hyde_mod, "_hyde_llm",
-                      return_value="Run svc_factory_reset to reinitialize the PowerStore cluster to factory defaults."):
-        out = hyde_mod.expand("BBU 怎么换？", llm_generate=True)
+    with patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", False):
+        with patch.object(hyde_mod, "_hyde_llm",
+                          return_value="Run svc_factory_reset to reinitialize the PowerStore cluster to factory defaults."):
+            out = hyde_mod.expand("BBU 怎么换？", llm_generate=True)
     assert len(out) == 2 and out[1].startswith("Run svc_factory_reset"), out
     print(f"  expand: {out}")
     print("✓ test_hyde_success")
+
+
+# ============ 4b) hyde LRU 缓存 ============
+def _tmp_cache():
+    import tempfile
+    from pathlib import Path as _P
+    return _P(tempfile.mkdtemp()) / "hyde_cache.jsonl"
+
+
+def test_hyde_cache_hit_skips_llm():
+    """缓存命中 → 完全跳过 LLM 调用（12s → ~1ms），这是压缩 latency 的主力。"""
+    cache_file = _tmp_cache()
+    with patch("mini_rag.config.settings.HYDE_CACHE_PATH", cache_file), \
+         patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", True), \
+         patch.object(hyde_mod, "_cache", None), \
+         patch.object(hyde_mod, "_hyde_llm", return_value="fake doc about BBU") as mock_llm:
+        out1 = hyde_mod.expand("BBU 怎么换", llm_generate=True)
+        assert mock_llm.call_count == 1, "首次未命中应调 LLM"
+        assert out1 == ["BBU 怎么换", "fake doc about BBU"], out1
+
+        out2 = hyde_mod.expand("BBU 怎么换", llm_generate=True)
+        assert mock_llm.call_count == 1, \
+            f"命中缓存不应再调 LLM，实为 {mock_llm.call_count} 次"
+        assert out2 == out1, "两次结果应一致"
+
+        # 归一化：多一个问号 / 大小写不同应命中同一条
+        out3 = hyde_mod.expand("BBU 怎么换？", llm_generate=True)
+        assert mock_llm.call_count == 1, f"问号差异应命中同一条，实为 {mock_llm.call_count}"
+        assert out3[1] == out1[1]
+    print("✓ test_hyde_cache_hit_skips_llm")
+
+
+def test_hyde_cache_persists_across_processes():
+    """缓存落盘 → 新进程（_cache=None）能读到。CLI 每次 ask 都是新进程，这条是关键。"""
+    import json
+    cache_file = _tmp_cache()
+    with patch("mini_rag.config.settings.HYDE_CACHE_PATH", cache_file), \
+         patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", True), \
+         patch.object(hyde_mod, "_cache", None), \
+         patch.object(hyde_mod, "_hyde_llm", return_value="persisted doc") as mock_llm:
+        hyde_mod.expand("持久化测试", llm_generate=True)
+        assert mock_llm.call_count == 1
+
+    # 模拟新进程：_cache 重置为 None，只能从文件读
+    assert cache_file.exists(), "缓存未落盘"
+    with patch("mini_rag.config.settings.HYDE_CACHE_PATH", cache_file), \
+         patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", True), \
+         patch.object(hyde_mod, "_cache", None), \
+         patch.object(hyde_mod, "_hyde_llm", return_value="SHOULD NOT BE CALLED") as mock_llm:
+        out = hyde_mod.expand("持久化测试", llm_generate=True)
+    assert mock_llm.call_count == 0, "新进程应从磁盘缓存命中，不该调 LLM"
+    assert out == ["持久化测试", "persisted doc"], out
+
+    # jsonl 格式校验：一行一条，含 query/doc/ts
+    lines = [l for l in cache_file.read_text(encoding="utf-8").splitlines() if l.strip()]
+    assert len(lines) == 1, f"应只有 1 条缓存，实为 {len(lines)}"
+    rec = json.loads(lines[0])
+    assert "query" in rec and "doc" in rec and "ts" in rec, f"字段缺失: {rec}"
+    print("✓ test_hyde_cache_persists_across_processes")
+
+
+def test_hyde_cache_lru_eviction():
+    """超过 HYDE_CACHE_SIZE 淘汰最久未用（最前），保留最近用的。"""
+    cache_file = _tmp_cache()
+    with patch("mini_rag.config.settings.HYDE_CACHE_PATH", cache_file), \
+         patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", True), \
+         patch("mini_rag.config.settings.HYDE_CACHE_SIZE", 3), \
+         patch.object(hyde_mod, "_cache", None), \
+         patch.object(hyde_mod, "_hyde_llm", side_effect=lambda q: f"doc for {q}"):
+        for i in range(5):
+            hyde_mod.expand(f"q{i}", llm_generate=True)
+        assert len(hyde_mod._cache) == 3, f"应淘汰到 3 条，实为 {len(hyde_mod._cache)}"
+        keys = list(hyde_mod._cache.keys())
+        # 最久未用的 q0/q1 应被淘汰，q2/q3/q4 保留
+        assert keys == ["q2", "q3", "q4"], f"淘汰顺序错: {keys}"
+    print("✓ test_hyde_cache_lru_eviction")
+
+
+def test_hyde_cache_disabled():
+    """关掉 HYDE_CACHE_ENABLED → 每次都调 LLM（用于评估对照）。"""
+    cache_file = _tmp_cache()
+    with patch("mini_rag.config.settings.HYDE_CACHE_PATH", cache_file), \
+         patch("mini_rag.config.settings.HYDE_CACHE_ENABLED", False), \
+         patch.object(hyde_mod, "_cache", None), \
+         patch.object(hyde_mod, "_hyde_llm", return_value="doc") as mock_llm:
+        hyde_mod.expand("q", llm_generate=True)
+        hyde_mod.expand("q", llm_generate=True)
+    assert mock_llm.call_count == 2, f"关缓存应每次都调 LLM，实为 {mock_llm.call_count}"
+    print("✓ test_hyde_cache_disabled")
+
+
+# ============ 4c) hyde 段落长度压缩 ============
+def test_hyde_truncate_words():
+    """段落超过 HYDE_MAX_WORDS 被硬截断（30-40 词压缩的保险丝）。"""
+    long_doc = " ".join(f"w{i}" for i in range(100))
+    with patch("mini_rag.config.settings.HYDE_MAX_WORDS", 45):
+        out = hyde_mod._truncate_words(long_doc, 45)
+    assert len(out.split()) == 45, f"应截断到 45 词，实为 {len(out.split())}"
+
+    short = "Run svc_factory_reset now."
+    assert hyde_mod._truncate_words(short, 45) == short, "短段落不应被改"
+    print("✓ test_hyde_truncate_words")
+
+
+def test_hyde_prompt_is_short():
+    """HYDE_PROMPT 必须要求 30-40 词（压缩目标写进 prompt，不只是截断）。"""
+    assert "30-40" in hyde_mod.HYDE_PROMPT, "prompt 未要求 30-40 词"
+    assert "30-40 words is a HARD LIMIT" in hyde_mod.HYDE_PROMPT
+    print("✓ test_hyde_prompt_is_short")
 
 
 # ============ 5) retriever mock_vec 不调 embed_query / 不调 LLM ============
@@ -212,6 +357,94 @@ def test_disable_mmr():
     print("✓ test_disable_mmr")
 
 
+# ============ 7) L3 生成后校验（零幻觉第三道）============
+# generator.validate_answer 已在 mini_rag/core/generator.py 实现（4 条规则），
+# 但此前无测试覆盖。这里补齐，并显式覆盖「误伤」边界——
+# 校验过严会把忠实转述也降级，等于把可用性让给零幻觉，两头不讨好。
+from mini_rag.core import generator as gen  # noqa: E402
+
+
+def _ctx(*contents: str):
+    """按内容构造 ScoredChunk 列表。"""
+    return [_scored(f"c{i}", 0.9 - i * 0.01, content=c)
+            for i, c in enumerate(contents)]
+
+
+def test_validate_citation_out_of_range():
+    """[N] 中 N 超出片段数 = 编造引用 → 拦截。"""
+    scored = _ctx("Run svc_factory_reset to reset the cluster.")
+    ok, why = gen.validate_answer("见[片段7]的说明。", scored)
+    assert not ok and "越界" in why, f"应拦截越界引用: {ok}, {why}"
+    # 未越界应放行
+    ok, why = gen.validate_answer("见[片段1]的说明。", scored)
+    assert ok, f"片段1 存在不应拦截: {why}"
+    print("✓ test_validate_citation_out_of_range")
+
+
+def test_validate_inference_phrase():
+    """推断话术（诉诸外部知识）→ 拦截。"""
+    scored = _ctx("Run svc_factory_reset to reset the cluster.")
+    ok, why = gen.validate_answer("一般来说，需要先检查电源。", scored)
+    assert not ok and "推断" in why, f"应拦截推断话术: {ok}, {why}"
+    print("✓ test_validate_inference_phrase")
+
+
+def test_validate_command_not_in_context():
+    """命令 / 专有标识符不在上下文 → 拦截（Dell 零容错的硬要求）。"""
+    scored = _ctx("Run svc_factory_reset to reset the cluster.")
+    # svc_factory_reset 在上下文 → 放行
+    ok, why = gen.validate_answer("Run `svc_factory_reset` now.", scored)
+    assert ok, f"上下文有的命令不应拦截: {why}"
+    # svc_nonexistent_zzz 不在 → 拦截
+    ok, why = gen.validate_answer("Run svc_nonexistent_zzz now.", scored)
+    assert not ok and "svc_nonexistent_zzz" in why, f"应拦截编造命令: {ok}, {why}"
+    print("✓ test_validate_command_not_in_context")
+
+
+def test_validate_version_not_in_context():
+    """版本号不在上下文 → 拦截。三段 + 四段都要覆盖。
+
+    2026-09-04：PowerStore OS 版本号是四段（4.3.0.0），旧正则只认三段，
+    把 "9.9.9.9" 截成 "9.9.9"，等于四段完全没被校验 —— 这里补上。
+    两段式不做：与章节号（1.2）难区分，误伤率高于收益。
+    """
+    scored = _ctx("PowerStore OS 3.0.0.0 is required.")
+    # 四段式：上下文有 → 放行
+    ok, why = gen.validate_answer("Requires 3.0.0.0 or later.", scored)
+    assert ok, f"上下文有的四段版本号不应拦截: {why}"
+    # 四段式：编造 → 拦截，且要报完整的四段（不是被截成三段）
+    ok, why = gen.validate_answer("Requires 9.9.9.9 or later.", scored)
+    assert not ok and "9.9.9.9" in why, f"应拦截编造四段版本号: {ok}, {why}"
+    # 三段式：编造 → 拦截
+    ok, why = gen.validate_answer("Requires 7.7.7 or later.", scored)
+    assert not ok and "7.7.7" in why, f"应拦截编造三段版本号: {ok}, {why}"
+    # 两段式：不做（章节号难区分）→ 放行
+    ok, why = gen.validate_answer("See section 8.2 for details.", scored)
+    assert ok, f"两段式是章节号，不应拦截: {why}"
+    print("✓ test_validate_version_not_in_context")
+
+
+def test_validate_accepts_faithful_answer():
+    """忠实转述必须放行——校验不能误伤，否则可用性归零。"""
+    ctx = ("To replace the battery backup unit (BBU), press the release latch "
+           "and slide the module out. Run svc_factory_reset afterwards.")
+    scored = _ctx(ctx)
+    faithful = ("To replace the BBU, press the release latch and slide the module out.\n"
+                "Afterwards run svc_factory_reset.")
+    ok, why = gen.validate_answer(faithful, scored)
+    assert ok, f"忠实转述被误伤: {why}"
+    print("✓ test_validate_accepts_faithful_answer")
+
+
+def test_validate_no_false_positive_on_plain_text():
+    """普通英文句子不该被「标识符」规则误伤（只有含 _ - . / 的 token 才校验）。"""
+    scored = _ctx("The cluster has two nodes. Each node runs the PowerStore OS.")
+    plain = "The cluster has two nodes and each node runs the PowerStore OS."
+    ok, why = gen.validate_answer(plain, scored)
+    assert ok, f"普通句子被误伤: {why}"
+    print("✓ test_validate_no_false_positive_on_plain_text")
+
+
 def main() -> int:
     tests = [
         test_mpr_basic,
@@ -220,12 +453,25 @@ def main() -> int:
         test_rewrite_svc_norm,
         test_rewrite_long_split,
         test_rewrite_no_zh_no_change,
+        test_rewrite_keeps_english_proper_nouns,
         test_hyde_fail_falls_back,
         test_hyde_success,
+        test_hyde_cache_hit_skips_llm,
+        test_hyde_cache_persists_across_processes,
+        test_hyde_cache_lru_eviction,
+        test_hyde_cache_disabled,
+        test_hyde_truncate_words,
+        test_hyde_prompt_is_short,
         test_retrieve_mock_no_embedder_no_llm,
         test_disable_rewrite,
         test_disable_hyde,
         test_disable_mmr,
+        test_validate_citation_out_of_range,
+        test_validate_inference_phrase,
+        test_validate_command_not_in_context,
+        test_validate_version_not_in_context,
+        test_validate_accepts_faithful_answer,
+        test_validate_no_false_positive_on_plain_text,
     ]
     passed = failed = 0
     for t in tests:

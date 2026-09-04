@@ -78,13 +78,56 @@
 
 **结论**：三开关全开对 hit@3 / hit@10 是显著提升（+12%~+30%），对 hit@1 提升有限（0%~+20%），代价每次查询多 25s。个人技术知识库使用模式（用户主动 ask）推荐全开；高频实时场景切 `--off-hyde`。
 
-**典型翻盘 case**：
-- P05 "如何重启控制器？"：baseline 0/1/1 → L1+MMR 1/1/1（svc_xxx 归一召回 svc_factory_reset）
-- P08 "BBU 故障" 类查询：baseline 0/0/0 → L1+MMR 1/1/1
-- P17 en_positive "snapshot schedule"：baseline 0/0/0 → full 0/1/1（HyDE 把 schedule 推入 top3）
-- P19 en_positive "data reduction ratio"：baseline 0/0/1 → full 1/1/1
+**典型翻盘 case**（真实查询，已按 eval_corpus.json 核实）：
+- P05 "PowerStore 数据库卷故障告警"：baseline 0/1/1 → L1+MMR 1/1/1
+- P08 "PowerStore base enclosure 更换流程"：baseline 0/0/0 → L1+MMR 1/1/1
+- P17 "svc_db_recovery service script"：baseline 0/0/0 → full 0/1/1（HyDE 推入 top3）
+- P19 "NDU from version 3.x to 3.x performance metrics not displayed"：baseline 0/0/1 → full 1/1/1
 
 详细报告：`_build/检索优化效果评估报告.html`。
+
+### 🔧 第二轮深度优化（2026-09-04 下午）
+
+用户拍板推进 4 项：扩 L1 词典、HyDE 压缩、HyDE 缓存、L3 校验。落地过程中连带发现并修复了更深的 bug。
+
+- **扩 L1 词典 + 保留英文专名**（`query_rewrite.py`）：
+  - `_ZH_TO_EN` 扩 24 词（升级/失败/重启/型号/规格/查看/状态/变更/版本/安装/配置/控制器/磁盘…）
+  - **关键修复**：旧实现把 query 里的英文专名全丢了（"PowerStore 4.3.0.0 release note" 只翻出 "change"），
+    而 ground_truth 恰恰是那些英文专名。现改为「英文专名 + 翻译词」双版本输出。
+  - 去重：翻译词若已在原 query 英文片段里，不再重复（避免 "BBU ... BBU battery"）
+- **HyDE 段落压缩**（`hyde.py`）：prompt 60-80 词 → 30-40 词 + `num_predict=80` + `HYDE_MAX_WORDS=45` 硬截断。
+  - 实测：纯生成 9.5s→5.3s（真减半），但总 latency 14.7s→10.5s（-29%）——模型加载税 5.2s 是固定项，与段落长度无关。
+- **HyDE LRU 缓存落盘**（`hyde.py`）：`data/hyde_cache.jsonl`，命中 0ms，跨进程持久化。
+  - 新增 `HYDE_CACHE_ENABLED / HYDE_CACHE_SIZE / HYDE_CACHE_PATH`（settings.py）
+  - key 归一化（去空白 + 小写 + 去首尾标点）
+- **L3 校验核查 + 修 3 个真 bug**（`generator.py`）：
+  - ① 句末句号被吃进标识符（`now.` / `svc_factory_reset.` 被判为编造）→ 匹配后 rstrip(".") + 缩写白名单
+  - ② ctx 只含 content 不含 file_name → LLM 正确引用文件名被判编造 → ctx 补 file_name
+  - ③ 版本号正则只认三段，PowerStore 四段版本号（4.3.0.0）完全漏检 → 补四段
+  - 修复前 L3 几乎把所有英文答案误杀降级为原文摘录（可用性归零）；修复后忠实转述放行、编造命令/版本号仍拦截。
+- **embedding 常驻策略可配**（`embedder.py` + settings）：`EMBED_KEEP_ALIVE`（环境变量 `MINIRAG_EMBED_KEEP_ALIVE` 覆盖）。
+  - 踩坑：30 条评估每条重新加载 2.5GB embedding 模型，反复内存冲击把 Ollama 搞崩（WinError 10061），崩前数据全丢。
+  - 批量评估/建索引设 `10m`；生产保持 `0`（避免与 3.4GB 生成模型同时驻留）。
+
+### 📊 第二轮评估关键发现：融合策略 > 单路
+
+针对 P15/P25 深挖，牵出对 9-3 架构评审「稀疏路是净负债」结论的修正。全量 30 条实测（纯检索层，不含 HyDE）：
+
+| 策略 | 30 条命中率 |
+|---|---|
+| dense-only（SPARSE_FALLBACK_ONLY=True，当前生产） | 60.0% |
+| sparse-only（BM25） | 63.3% |
+| **RRF 融合（dense + sparse）** | **73.3%** |
+
+- 9-3 结论「本组合下稀疏路是净负债」**只对了一半**：那是纯中文查询测出的。本基准 30 条里 29 条含英文专名，sparse 对英文术语精确匹配极强。
+- **P15**（版本号 4.3.0.0）：dense 排 14 / sparse 排 2 → 融合命中
+- **P25**（PPT 转 EKT 幻灯片，dense 抓不住）：dense 不在 top20 / sparse 排 1 → 融合命中
+- **P06**：dense 排 5 / sparse 排 1 → 融合独家命中
+- 负例 N01-N05 融合后仍 0% 命中，零幻觉守住。
+
+**待办（本轮发现，尚未落地）**：
+1. 融合策略改「dense + sparse 全量 RRF」，但必须给 sparse 加阈值闸门（9-3 已发现无阈值时噪声挤进 top4）
+2. 修正 P21 基准：语料（60 文件采样）里没有 svc_journalctl 文档，需换成真实存在的 svc 文档
 
 ---
 

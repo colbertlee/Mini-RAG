@@ -22,6 +22,9 @@ from mini_rag.config import settings
 
 
 # 中英术语映射（只收强信号词——多义词不收，避免误翻）
+# 弱信号动词（查看/状态等）例外放行：rewrite 是 additive 的，多产一个 query
+# 只会多花一次 embedding，不会破坏主路（dense 有 DENSE_MIN 阈值把关），
+# 收益（召回命中）大于风险（多 ~1s latency）。
 _ZH_TO_EN = {
     "快照": "snapshot",
     "克隆": "clone",
@@ -79,11 +82,42 @@ _ZH_TO_EN = {
     "恢复": "recovery restore",
     "时间同步": "NTP time sync",
     "时间偏差": "time skew",
+
+    # —— 2026-09-04 扩充：通用运维动词 / 产品词（原缺失，导致多类查询零变体）——
+    "失败": "failure failed error",
+    "重启": "reboot restart",
+    "型号": "model model number",
+    "规格": "specifications spec",
+    "查看": "view check display",
+    "状态": "status state",
+    "变更": "change",
+    "变更内容": "what's new change list",
+    "版本": "version release",
+    "升级失败": "upgrade failure failed upgrade",
+    "安装": "install installation",
+    "配置": "configure configuration",
+    "创建": "create",
+    "删除": "delete remove",
+    "端口": "port",
+    "磁盘": "disk drive",
+    "控制器": "controller",
+    "电源": "power supply PSU",
+    "风扇": "fan",
+    "温度": "temperature thermal",
+    "许可证": "license",
+    "密码": "password",
+    "证书": "certificate",
+    "主机": "host",
+    "保护": "protection",
+    "迁移": "migration migrate",
 }
 
 # 英文命令归一：svc_xxx ↔ xxx（PowerStore 服务脚本大量用下划线形式，
 # 但 KB 文章里常脱去 svc_ 前缀。归一后用纯词匹配可命中两种写法）
 _CMD_NORM = re.compile(r"^svc[_\-](.+)$", re.I)
+
+# 一条 query 最多翻译几个中文术语（防止词袋过散，embedding 语义被稀释）
+_MAX_TERMS = 4
 
 
 def _normalize_svc(name: str) -> list[str]:
@@ -114,18 +148,34 @@ def rewrite(query: str) -> list[str]:
             out.append(q)
 
     # 1. 中文 → 英文（仅当 query 含中文且匹配术语表）
+    #    关键：英文专名（PowerStore / 版本号 / svc_xxx / NAS server）必须保留。
+    #    旧实现只输出中文术语的英文翻译，把 query 里的英文强信号全丢了 ——
+    #    "PowerStore 4.3.0.0 release note 变更内容" 只能翻出 "change"，
+    #    "svc_journalctl 怎么看日志" 翻出 "journal log" 却丢了 svc_journalctl。
+    #    这类查询的 ground_truth 恰恰就是那些英文专名，所以必须留住。
     if re.search(r"[\u4e00-\u9fff]", query):
-        zh_terms = []
-        for zh, en in _ZH_TO_EN.items():
-            if zh in query:
-                zh_terms.append(zh)
+        zh_terms = [zh for zh in _ZH_TO_EN if zh in query]
+        # 按在 query 中首次出现位置排序，靠前的通常是主语（更重要）
+        zh_terms.sort(key=query.index)
         if zh_terms:
-            # 英文 query 用空格连接术语
-            en_tokens = set()
-            for zh in zh_terms:
+            # 非中文片段 = 英文专名 / 版本号 / svc 命令 → 强信号，保留
+            non_zh_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-\.]*", query)
+            non_zh = " ".join(non_zh_tokens)
+            already = {t.lower() for t in non_zh_tokens}
+            en_tokens: list[str] = []
+            for zh in zh_terms[:_MAX_TERMS]:
                 for w in _ZH_TO_EN[zh].split():
-                    en_tokens.add(w)
-            _add(" ".join(sorted(en_tokens)))
+                    # 已在原 query 的非中文片段里 → 不重复（避免 "BBU ... BBU battery"）
+                    if w.lower() in already:
+                        continue
+                    if w not in en_tokens:
+                        en_tokens.append(w)
+            merged = " ".join(en_tokens)
+            if non_zh:
+                # 主改写：英文专名 + 翻译词（最强，救 P15/P21 这类）
+                _add(f"{non_zh} {merged}".strip())
+            # 纯翻译版：中文全剥，语域更贴近全英文语料
+            _add(merged)
 
     # 2. svc_xxx 命令归一
     for m in re.finditer(r"\bsvc[_\-][a-zA-Z_]+", query):

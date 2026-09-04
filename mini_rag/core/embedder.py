@@ -67,11 +67,25 @@ def _ollama_embed_texts(texts: list[str],
 
 
 def _ollama_embed_query(q: str) -> list[float]:
-    # keep_alive=0：查询向量化后立即卸载 embedding 模型，给生成模型腾内存
+    # keep_alive 默认 "0"：查询向量化后立即卸载，给生成模型腾内存。
+    # 批量评估/建索引时用 MINIRAG_EMBED_KEEP_ALIVE=10m 让模型常驻 ——
+    # 否则每条 query 都重新加载 2.5GB，反复内存冲击会把 Ollama 搞崩。
     data = _post(f"{settings.OLLAMA_URL}/api/embed",
                  {"model": settings.EMBED_MODEL, "input": [q],
-                  "options": {"num_gpu": 0}, "keep_alive": "0"})
+                  "options": {"num_gpu": 0},
+                  "keep_alive": getattr(settings, "EMBED_KEEP_ALIVE", "0")})
     return data["embeddings"][0]
+
+
+def unload_embed_model() -> bool:
+    """卸载 embedding 模型（批量任务结束后释放内存）。失败不影响主流程。"""
+    try:
+        _post(f"{settings.OLLAMA_URL}/api/embed",
+              {"model": settings.EMBED_MODEL, "input": [""],
+               "options": {"num_gpu": 0}, "keep_alive": "0"})
+        return True
+    except Exception:
+        return False
 
 
 class OllamaEmbedder:

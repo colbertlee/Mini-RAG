@@ -88,6 +88,13 @@ def _chat(user: str) -> str:
     return re.sub(r"<think>.*?</think>", "", ans, flags=re.S).strip()
 
 
+# 英文缩写白名单：含点但不是标识符，不能被规则 3 误判（"e.g." / "i.e." 等）
+_ABBREV_OK = {
+    "e.g", "i.e", "etc", "vs", "fig", "no", "approx", "inc", "ltd", "al",
+    "u.s.a", "u.s", "a.m", "p.m", "mr", "ms", "dr", "st", "jr", "sr",
+}
+
+
 def validate_answer(answer: str, scored: list[ScoredChunk]) -> tuple[bool, str]:
     """L3 生成后校验（纯规则，零额外模型调用）。返回 (通过?, 失败原因)。
 
@@ -96,8 +103,16 @@ def validate_answer(answer: str, scored: list[ScoredChunk]) -> tuple[bool, str]:
     2. 推断话术 —— 诉诸外部知识 / 不确定推断的措辞（见 settings.INFERENCE_PHRASES）。
     3. 命令/专有标识符逐字比对 —— 含 `_ - . /` 的 token 必须出现在某块上下文中。
     4. 版本号比对 —— 三段式版本号必须在上下文中出现（两段式与章节号难区分，不做）。
+
+    2026-09-04 修两个误伤 bug（此前 L3 几乎把所有英文答案都误杀降级）：
+      a. 句末句号被吃进 token：正则含 `.`，"now." / "svc_factory_reset." 会被当成
+         标识符去比对，必然失败 → 匹配后 rstrip(".")。
+      b. ctx 只含 content 不含 file_name：LLM 正确引用文件名（如 pwrstr-4-3-0-0-rn.pdf）
+         时会被判为编造 → ctx 补上 file_name。
     """
+    # ctx 同时收内容与文件名：文件名也是检索到的合法证据
     ctx = [s.chunk.content.lower() for s in scored]
+    ctx += [s.chunk.file_name.lower() for s in scored]
 
     # 1. 引用编号越界
     n = len(scored)
@@ -113,12 +128,19 @@ def validate_answer(answer: str, scored: list[ScoredChunk]) -> tuple[bool, str]:
     # 3. 命令/专有标识符逐字比对（Dell 命令几乎都是 svc_xxx 这类下划线形式）。
     #    字母开头：纯数字开头的 token（版本号/IP/页码）留给规则 4 或跳过。
     for m in re.finditer(r"[A-Za-z][A-Za-z0-9_\-\./]{2,}", answer):
-        t = m.group(0)
+        t = m.group(0).rstrip(".")     # (a) 句末句号不属于标识符
+        if len(t) < 3:
+            continue
+        if t.lower() in _ABBREV_OK:    # (a) 英文缩写不是标识符
+            continue
         if any(ch in t for ch in "_/-.") and not any(t.lower() in c for c in ctx):
             return False, f"命令/标识符不在上下文: {t}"
 
-    # 4. 版本号比对（仅三段式）
-    for v in re.findall(r"\b\d+\.\d+\.\d+\b", answer):
+    # 4. 版本号比对（三段 + 四段）。
+    #    2026-09-04：补四段式 —— PowerStore OS 版本号就是四段（4.3.0.0 / 3.0.0.0），
+    #    旧正则只认三段，把 "9.9.9.9" 截成 "9.9.9"，等于四段版本号完全没被校验。
+    #    两段式不做：与章节号（1.2）难区分，误伤率高于收益。
+    for v in re.findall(r"\b\d+\.\d+\.\d+(?:\.\d+)?\b", answer):
         if not any(v in c for c in ctx):
             return False, f"版本号不在上下文: {v}"
 

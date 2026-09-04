@@ -201,15 +201,21 @@ def _run_mock(retriever_fn, tag: str) -> None:
     print(f"\n明细已写入: {out}")
 
 
-def _run_online(retriever_fn, tag: str, limit_n: int | None = None) -> None:
+def _run_online(retriever_fn, tag: str, limit_n: int | None = None,
+                only: str | None = None, out_path: str | None = None) -> None:
     """在线语义评估：调真实 embed_query。"""
     from mini_rag.core import embedder
     cases = load_corpus()
-    if limit_n:
+    if only:
+        # 只跑指定 case（逗号分隔），用于针对性复测失败 case
+        wanted = {s.strip().upper() for s in only.split(",") if s.strip()}
+        cases = [c for c in cases if c["id"].upper() in wanted]
+        print(f"[{tag}] 只跑 {len(cases)} 条: {', '.join(c['id'] for c in cases)}")
+    elif limit_n:
         cases = cases[:limit_n]
         print(f"[{tag}] 跑前 {limit_n} 条 query ...")
     else:
-        print(f"[{tag}] 跑 30 条 query 真实 embedding ...")
+        print(f"[{tag}] 跑 {len(cases)} 条 query 真实 embedding ...")
     rows = []
     for case in cases:
         t0 = time.time()
@@ -244,7 +250,9 @@ def _run_online(retriever_fn, tag: str, limit_n: int | None = None) -> None:
 
     summary = _summarize(rows)
     _print_table(summary, tag)
-    out = REPORT_DIR / f"eval_{tag}_report.json"
+    from pathlib import Path as _P
+    out = _P(out_path) if out_path else REPORT_DIR / f"eval_{tag}_report.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(summary, ensure_ascii=False, indent=2),
                    encoding="utf-8")
     print(f"\n明细已写入: {out}")
@@ -263,6 +271,10 @@ def main() -> int:
                     help="关闭 MMR（强制 baseline 行为）")
     ap.add_argument("--limit", type=int,
                     help="只跑前 N 条 query（适合 HyDE 长任务分批跑）")
+    ap.add_argument("--only", metavar="IDS",
+                    help="只跑指定 case（逗号分隔，如 P15,P21,P25）—— 针对性复测失败 case")
+    ap.add_argument("--out", metavar="PATH",
+                    help="输出 JSON 路径（默认 _build/eval_<tag>_report.json）")
     args = ap.parse_args()
 
     # baseline = 关掉三层改造，等价 v0.1.0 行为
@@ -285,7 +297,8 @@ def main() -> int:
         from mini_rag.core import retriever as r
         fn = r.retrieve
         if args.online:
-            _run_online(fn, "baseline", limit_n=args.limit)
+            _run_online(fn, "baseline", limit_n=args.limit, only=args.only,
+                        out_path=args.out)
         else:
             # baseline：直接调内部函数注入 mock 向量
             def baseline_fn(q, mock_vec):
@@ -313,7 +326,8 @@ def main() -> int:
         from mini_rag.core import retriever as r
         fn = r.retrieve
         if args.online:
-            _run_online(fn, "optimized", limit_n=args.limit)
+            _run_online(fn, "optimized", limit_n=args.limit, only=args.only,
+                        out_path=args.out)
         else:
             # optimized 也走 mock，验证改造后逻辑
             def optimized_fn(q, mock_vec):
