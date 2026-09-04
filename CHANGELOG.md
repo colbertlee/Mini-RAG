@@ -2,6 +2,79 @@
 
 本项目所有显著变更记录于此。版本号遵循 [语义化版本 2.0.0](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-09-04
+
+**本版本无代码功能变更**，是诊断结论归档 + 决策落地 + 文档体系同步。
+v0.2.0 发布后遗留的两个悬而未决项（P08 根因、P02 策略）在本版本完成闭环并写入文档。
+
+### 🔍 Diagnostics（P08 根因，v0.2.0 遗留的唯一未诊断 miss）
+
+- **P08 miss 根因确诊**：`BM25 长度归一 + 低 IDF 对操作手册类长步骤文档的结构性歧视`，
+  不是此前假设的「dense 判别词过滤误伤」（该假设已被推翻：GT 的 5 个 chunk 全部命中
+  判别词 base/enclosure）。诊断脚本 `_build/probe_p08.py`（零模型，不占 embedding 内存）。
+  - 证据链：GT 文档（Replace a base enclosure.pdf）的单词 `enclosure` BM25 仅 **rank28-33
+    （5.05）**，被安装手册/规格页的高密度块（5.27~5.53）压制，原 query 下连 sparse top20
+    都不进；`base` DF=304 / `enclosure` DF=287（总 chunk≈3425），IDF 过低。
+  - 传导路径：GT sparse 零票 → 融合时 GT 只剩 dense 单票，而对手是 sparse+dense 双票
+    → 挤出 top10。`RRF_DOC_VOTE_CAP` 管的是**同文档堆叠票**，救不了「GT 单路单票 vs
+    对手双路票」—— 与 P15/P24 同族不同型，故 cap=3 对其无效（cap 前后 P08 均 miss）。
+  - 时间线佐证：第二轮（无证据闸）GT = dense 语义 top1（0.733）hit@1 ✓ → 证据闸轮
+    dense_top1 变 0.677（别家文档）hit 全灭 → cap=3 轮不变。
+- **修复候选已列出但未热修**（改动影响面大，留给后续版本决策）：
+  ① query token 命中 `file_name` 的文件级加权（**推荐** —— P08 的 query 与 GT 文档名
+  字面重叠 100%；需兼容 P15 的 `4-3-0-0` vs `4.3.0.0` 连字符错配）；
+  ② FTS5 `file_name` 列加权（需 rebuild）；③ dense rank1 保底票（全局影响大）；
+  ④ 接受残留（当前状态）。
+
+### ✅ Decisions（P02 策略拍板）
+
+- **P02「检索命中但上下文无完整操作步骤」维持严格拒答**：`SYSTEM_PROMPT` 规则 2
+  不做任何放宽。这是**零幻觉严格性 vs 可用性**的显式权衡 —— 实测 P02 检索 hit@1 正确命中
+  BBU 文档，但 LLM 判定上下文只有告警/识别内容、无完整更换步骤，按规则 2 拒答。
+  放宽为「给确定部分信息 + 标注缺失」或调大 `FINAL_TOP_N` 都会引入幻觉风险。
+  **决策：接受可用性代价，勿再提放宽选项。** 对照 P01（svc_factory_reset）完整作答，
+  证明链路健康 —— 拒答是上下文驱动的，不是模型故障。
+
+### 📝 Documentation
+
+- **`README.md` 重写（v0.1.0 态 → v0.2.1 态）**：原版完全没有检索侧内容（v0.2.x 的
+  全部工作），版本徽章也停在 v0.1.0。新增「检索架构」「零幻觉四道防线」两章，
+  参数表补齐 14 个检索侧参数，实测数据换 30 条基准（含分类延迟），
+  补已知残留表（P08/P15/N03-N04/P02 及各自决策）与「明确不做」的范围边界。
+- **`DOC-01` ~ `DOC-06` 全系列从立项规范同步为落地实现**。这六份文档停留在 v1.1.0
+  规划态，与代码严重脱节，本次逐份校正：
+  - `DOC-01`：元数据 schema 对齐实现（`doc_name/page_number/heading_path` →
+    `doc_title/page_start~page_end/section_path`）；解析器改为 PyMuPDF（原写 pdfplumber）；
+    切片策略对齐三档自适应（原写固定 512/64）。
+  - `DOC-02`：评估基准从「Context Recall ≥92% / Precision ≥90% / Citation ≥98%」的
+    **未达标规划目标**换成 30 条实测基准与四道防线；测试用例从 OneFS/Brocade 规划示例
+    换成 `_build/eval_corpus.json` 的真实用例。
+  - `DOC-03`：补 `think:false` 硬约束、L3 生成后校验、推断话术清单、P02 拍板结论；
+    相似度阈值 0.65 → 实测标定值 0.60。
+  - `DOC-04`：模型选型从 bge-small-zh / qwen2.5:7b 换成实测在用的
+    qwen3-embedding:4b（2560 维）/ qwen3.5:4b；向量存储按 2560 维重算；
+    补内存铁律（≥4GB 才建索引、`EMBED_KEEP_ALIVE`、`num_gpu=0`）。
+  - `DOC-05`：清除命令 `rag_tool.py --purge` → `python -m mini_rag.cli purge`。
+  - `DOC-06`：全文重写 —— 原版 `rag_tool.py --folder --reindex` 是不存在的 CLI，
+    模型名也是错的（qwen2.5:7b-instruct）。改为真实六命令 + 三开关 + 溯源用法。
+- **所有文档版本号升至 v2.0.0**，并标注「与实现同步日期 2026-09-04」。
+
+### 🐛 Bug Fixes（文档层）
+
+- 订正 `--off-hyde` 的错误表述：v0.2.0 的 CHANGELOG 把它写成 `ask` 命令的用法，
+  实际它**只存在于 `scripts/eval_retrieval.py`**（`--off-hyde` / `--off-rewrite` /
+  `--off-mmr` 均为评估脚本参数）。生产环境关闭 HyDE 需设 `settings.HYDE_ENABLED = False`。
+  此条已同步进 README 第 7 节的参数表注解。
+
+### 📊 基准与索引现状（存档）
+
+- 30 条基准终态：**66.7 / 76.7 / 80.0**（baseline 40.0 / 56.7 / 60.0），
+  平均延迟 801 ms/query（baseline 7574 ms，差额主要是 embedding 模型是否常驻）。
+- 分类：en_positive 100/100/100 · zh_mix 80/100/100 · zh_positive 73.3/86.7/93.3 ·
+  negative 0/0/0（全拒，期望结果）。
+- 当前索引为 **Powerstore 60 文件采样 / 3469 chunk**（成功 58 / 失败 2），
+  非全量 331 文件 —— 入库全量后所有阈值需重标定。
+
 ## [0.2.0] - 2026-09-04
 
 检索架构五轮优化闭环：L1 Query Rewrite + L2 HyDE + 多路 RRF/MMR + 语料证据闸 + RRF 文档票数封顶。
